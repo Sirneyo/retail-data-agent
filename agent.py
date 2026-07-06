@@ -19,6 +19,7 @@ class AgentState(TypedDict):
     sql: Optional[str]
     result: Optional[pd.DataFrame]
     answer: Optional[str]
+    report: Optional[str]
     error: Optional[str]        # last failure message (BigQuery's or ours)
     retries: int                # fix attempts so far this question
 
@@ -170,6 +171,27 @@ def give_up(state: AgentState) -> dict:
     return {"answer": ("I couldn't get a working query for that after a few attempts. "
                        "Could you rephrase the question, or make it more specific?")}
 
+# ---------- Report generation: the analyst write-up ----------
+REPORT_SYSTEM = """You are a senior retail data analyst writing for a non-technical executive.
+Given a question, the SQL used, and the result data, write a SHORT report:
+- Lead with the direct answer in one sentence
+- 2-3 bullet points of notable insights from the data
+- One caveat or recommendation if genuinely relevant
+Keep it under 120 words. No headers, no fluff, no repeating the raw table."""
+
+def generate_report(state: AgentState) -> dict:
+    df = state["result"]
+    sample = df.head(20).to_string(index=False)
+    trios = retrieve_trios(state["question"], k=2)
+    style = "\n---\n".join(t["report"] for t in trios)
+    resp = llm.invoke([
+        ("system", REPORT_SYSTEM),
+        ("human", f"Question: {state['question']}\n\nSQL used:\n{state['sql']}\n\n"
+                  f"Result ({len(df)} rows, first 20 shown):\n{sample}\n\n"
+                  f"Example analyst reports for tone reference:\n{style}"),
+    ])
+    return {"report": llm_text(resp)}
+
 # ---------- Schema Q&A ----------
 def answer_schema(state: AgentState) -> dict:
     schemas = {t: runner.get_table_schema(t)
@@ -185,6 +207,7 @@ builder = StateGraph(AgentState)
 builder.add_node("route_question", route_question)
 builder.add_node("generate_sql", generate_sql)
 builder.add_node("execute_sql", execute_sql)
+builder.add_node("generate_report", generate_report)
 builder.add_node("answer_schema", answer_schema)
 builder.add_node("give_up", give_up)
 
@@ -202,15 +225,16 @@ builder.add_conditional_edges(
 )
 builder.add_conditional_edges(
     "execute_sql", check_execution,
-    {"success": END, "retry": "generate_sql", "give_up": "give_up"},
+    {"success": "generate_report", "retry": "generate_sql", "give_up": "give_up"},
 )
+builder.add_edge("generate_report", END)
 builder.add_edge("answer_schema", END)
 builder.add_edge("give_up", END)
 graph = builder.compile()
 
 # ---------- CLI ----------
 if __name__ == "__main__":
-    print("Retail Data Agent (Phase 3) — type 'exit' to quit.")
+    print("Retail Data Agent (Phase 4) — type 'exit' to quit.")
     while True:
         q = input("\nAsk> ").strip()
         if q.lower() in {"exit", "quit"}:
@@ -218,6 +242,14 @@ if __name__ == "__main__":
         final = graph.invoke({"question": q, "retries": 0})
         if final.get("answer"):
             print("\n" + final["answer"])
+        elif final.get("report"):
+            print("\n=== REPORT ===\n" + final["report"])
+            print("\n--- SQL ---\n" + final["sql"])
+            df = final["result"]
+            print("\n--- DATA (first 20 rows) ---")
+            print(df.head(20).to_string(index=False))
+            if len(df) > 20:
+                print(f"... and {len(df) - 20} more rows")
         else:
             print("\n--- SQL ---\n" + final["sql"])
             print("\n--- RESULT ---")
