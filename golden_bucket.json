@@ -1,0 +1,50 @@
+[
+  {
+    "id": 1,
+    "question": "Who are our top 10 customers by total spend?",
+    "sql": "SELECT u.id AS user_id, CONCAT(u.first_name, ' ', u.last_name) AS customer_name, ROUND(SUM(oi.sale_price), 2) AS lifetime_spend, COUNT(DISTINCT oi.order_id) AS orders_count FROM `bigquery-public-data.thelook_ecommerce.order_items` oi JOIN `bigquery-public-data.thelook_ecommerce.users` u ON oi.user_id = u.id WHERE oi.status NOT IN ('Cancelled', 'Returned') GROUP BY u.id, customer_name ORDER BY lifetime_spend DESC LIMIT 10",
+    "report": "Top customers ranked by lifetime spend, excluding cancelled and returned items so the figures reflect realised revenue. Note: 'top' is defined by money spent, not order count — a customer with 3 large orders outranks one with 20 small ones. Recommend cross-checking top names against repeat-purchase behaviour for retention targeting."
+  },
+  {
+    "id": 2,
+    "question": "What is our monthly revenue trend for the last 12 months?",
+    "sql": "SELECT FORMAT_TIMESTAMP('%Y-%m', oi.created_at) AS month, ROUND(SUM(oi.sale_price), 2) AS revenue FROM `bigquery-public-data.thelook_ecommerce.order_items` oi WHERE oi.status NOT IN ('Cancelled', 'Returned') AND DATE(oi.created_at) >= DATE_SUB(CURRENT_DATE(), INTERVAL 12 MONTH) GROUP BY month ORDER BY month",
+    "report": "Monthly realised revenue over the trailing 12 months. Cancelled/returned items excluded. Watch for the most recent month appearing artificially low — it is usually incomplete. Month-over-month changes above ±15% warrant a drill-down into category or traffic-source mix."
+  },
+  {
+    "id": 3,
+    "question": "Which are our best selling products?",
+    "sql": "SELECT p.id AS product_id, p.name AS product_name, p.brand, COUNT(*) AS units_sold, ROUND(SUM(oi.sale_price), 2) AS total_revenue FROM `bigquery-public-data.thelook_ecommerce.order_items` oi JOIN `bigquery-public-data.thelook_ecommerce.products` p ON oi.product_id = p.id WHERE oi.status NOT IN ('Cancelled', 'Returned') GROUP BY p.id, p.name, p.brand ORDER BY total_revenue DESC LIMIT 20",
+    "report": "Best sellers shown two ways: units sold and revenue. These rankings differ — high-volume cheap items vs low-volume expensive items — so both columns are included and the default sort is revenue. For merchandising decisions, units matter; for finance, revenue."
+  },
+  {
+    "id": 4,
+    "question": "How is each product category performing?",
+    "sql": "SELECT p.category, COUNT(*) AS units_sold, ROUND(SUM(oi.sale_price), 2) AS revenue, ROUND(AVG(oi.sale_price), 2) AS avg_item_price, ROUND(SUM(oi.sale_price - p.cost), 2) AS gross_profit FROM `bigquery-public-data.thelook_ecommerce.order_items` oi JOIN `bigquery-public-data.thelook_ecommerce.products` p ON oi.product_id = p.id WHERE oi.status NOT IN ('Cancelled', 'Returned') GROUP BY p.category ORDER BY revenue DESC",
+    "report": "Category performance across four lenses: volume, revenue, average price point, and gross profit (sale price minus product cost). Revenue leaders are not always profit leaders — margin varies sharply by category. Recommend reviewing the profit column before any promotion decisions."
+  },
+  {
+    "id": 5,
+    "question": "What is our average order value?",
+    "sql": "SELECT ROUND(SUM(order_total) / COUNT(*), 2) AS avg_order_value FROM (SELECT oi.order_id, SUM(oi.sale_price) AS order_total FROM `bigquery-public-data.thelook_ecommerce.order_items` oi WHERE oi.status NOT IN ('Cancelled', 'Returned') GROUP BY oi.order_id)",
+    "report": "AOV computed order-first (sum items to order totals, then average the orders) — averaging item prices directly would understate multi-item orders. Cancelled/returned items excluded. AOV is most useful tracked over time or segmented by traffic source rather than as a single number."
+  },
+  {
+    "id": 6,
+    "question": "How many of our customers are repeat buyers versus one-time buyers?",
+    "sql": "SELECT buyer_type, COUNT(*) AS customers, ROUND(100 * COUNT(*) / SUM(COUNT(*)) OVER (), 1) AS pct FROM (SELECT user_id, CASE WHEN COUNT(DISTINCT order_id) > 1 THEN 'repeat' ELSE 'one_time' END AS buyer_type FROM `bigquery-public-data.thelook_ecommerce.orders` WHERE status NOT IN ('Cancelled', 'Returned') GROUP BY user_id) GROUP BY buyer_type",
+    "report": "Customer base split by purchase frequency. Repeat rate is a core retention health metric — e-commerce benchmarks typically sit between 20-40%. If the repeat share is low, investigate whether top acquisition channels are bringing one-and-done buyers (join against traffic_source)."
+  },
+  {
+    "id": 7,
+    "question": "Which traffic sources bring us the most valuable customers?",
+    "sql": "SELECT u.traffic_source, COUNT(DISTINCT u.id) AS customers, ROUND(SUM(oi.sale_price), 2) AS total_revenue, ROUND(SUM(oi.sale_price) / COUNT(DISTINCT u.id), 2) AS revenue_per_customer FROM `bigquery-public-data.thelook_ecommerce.users` u JOIN `bigquery-public-data.thelook_ecommerce.order_items` oi ON oi.user_id = u.id WHERE oi.status NOT IN ('Cancelled', 'Returned') GROUP BY u.traffic_source ORDER BY revenue_per_customer DESC",
+    "report": "Acquisition channels ranked by revenue per customer, not raw revenue — a channel bringing fewer but higher-value customers beats a high-volume low-value one for marketing ROI. Pair with acquisition cost data (not in this dataset) before reallocating spend."
+  },
+  {
+    "id": 8,
+    "question": "What is our order cancellation and return rate?",
+    "sql": "SELECT status, COUNT(*) AS orders, ROUND(100 * COUNT(*) / SUM(COUNT(*)) OVER (), 1) AS pct FROM `bigquery-public-data.thelook_ecommerce.orders` GROUP BY status ORDER BY orders DESC",
+    "report": "Full order status breakdown with percentages. Cancellation and return rates are leading indicators of fulfilment or product-quality issues — a rising return rate in one category usually precedes negative reviews. This is the one analysis where cancelled/returned orders are deliberately INCLUDED, since they are the subject."
+  }
+]

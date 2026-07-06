@@ -1,8 +1,10 @@
-import os, re
+import os, re, json
 from typing import TypedDict, Optional
 
+import numpy as np
 import pandas as pd
 from dotenv import load_dotenv
+from google import genai
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langgraph.graph import StateGraph, START, END
 
@@ -17,15 +19,52 @@ class AgentState(TypedDict):
     sql: Optional[str]
     result: Optional[pd.DataFrame]
     answer: Optional[str]
+    error: Optional[str]        # last failure message (BigQuery's or ours)
+    retries: int                # fix attempts so far this question
 
 # ---------- Shared clients ----------
 llm = ChatGoogleGenerativeAI(
-    model="gemini-3.5-flash",
+    model="gemini-3.1-flash-lite",
     temperature=0,
     google_api_key=os.environ["GOOGLE_API_KEY"],
 )
 runner = BigQueryRunner(project_id=os.environ.get("GCP_PROJECT_ID"))
 DATASET = "bigquery-public-data.thelook_ecommerce"
+
+# ---------- Schema context: fetched once at startup ----------
+def load_schema_context() -> str:
+    lines = []
+    for t in ["orders", "order_items", "products", "users"]:
+        cols = ", ".join(f"{c['name']} ({c['type']})"
+                         for c in runner.get_table_schema(t))
+        lines.append(f"Table {t}: {cols}")
+    return "\n".join(lines)
+
+SCHEMA_CONTEXT = load_schema_context()
+MAX_RETRIES = 2   # total attempts = 1 original + 2 retries
+
+# ---------- Golden Bucket: RAG retrieval layer ----------
+EMBED_MODEL = "gemini-embedding-001"
+genai_client = genai.Client(api_key=os.environ["GOOGLE_API_KEY"])
+
+def embed(texts: list[str]) -> np.ndarray:
+    """Convert texts to meaning-vectors via Google's embedding model."""
+    result = genai_client.models.embed_content(model=EMBED_MODEL, contents=texts)
+    return np.array([e.values for e in result.embeddings])
+
+# Build the index: load bucket, embed all Trio questions once at startup
+with open("golden_bucket.json", "r", encoding="utf-8") as f:
+    GOLDEN_BUCKET = json.load(f)
+
+BUCKET_VECTORS = embed([t["question"] for t in GOLDEN_BUCKET])
+
+def retrieve_trios(question: str, k: int = 3) -> list[dict]:
+    """Embed the new question, cosine-match against the index, return top k Trios."""
+    q_vec = embed([question])[0]
+    sims = BUCKET_VECTORS @ q_vec / (
+        np.linalg.norm(BUCKET_VECTORS, axis=1) * np.linalg.norm(q_vec) + 1e-9)
+    top_idx = np.argsort(sims)[::-1][:k]
+    return [GOLDEN_BUCKET[i] for i in top_idx]
 
 # ---------- Helper: normalise LLM replies to plain text ----------
 def llm_text(resp) -> str:
@@ -43,7 +82,7 @@ def llm_text(resp) -> str:
         return "".join(parts)
     return str(c)
 
-# ---------- Router: stamps one label on every message ----------
+# ---------- Router ----------
 ROUTER_SYSTEM = """You route messages for a retail data assistant. Classify into ONE label:
 - analysis: needs data from the database (metrics, trends, customers, products, revenue)
 - schema: asks about database structure (tables, columns)
@@ -67,24 +106,71 @@ def route_question(state: AgentState) -> dict:
                          "products, customers, or revenue and I'll dig in.")
     return out
 
-# ---------- Worker nodes ----------
+# ---------- SQL generation (schema-aware, RAG-informed, self-healing, honest) ----------
 SQL_SYSTEM = f"""You are a BigQuery Standard SQL expert.
 Write ONE valid query answering the user's question.
-Dataset `{DATASET}`, tables: orders, order_items, products, users.
+Dataset `{DATASET}`. Schemas:
+{SCHEMA_CONTEXT}
 Always fully-qualify tables, e.g. `{DATASET}.orders`.
+Always alias aggregate columns with descriptive names (e.g. SUM(...) AS total_revenue).
 Return ONLY raw SQL — no markdown, no commentary."""
 
 def generate_sql(state: AgentState) -> dict:
-    resp = llm.invoke([("system", SQL_SYSTEM), ("human", state["question"])])
+    trios = retrieve_trios(state["question"], k=3)
+    examples = "\n\n".join(
+        f"Past question: {t['question']}\nAnalyst's SQL: {t['sql']}\nAnalyst's notes: {t['report']}"
+        for t in trios)
+    messages = [
+        ("system", SQL_SYSTEM),
+        ("human", f"Here is how expert analysts answered similar past questions:\n\n{examples}\n\n"
+                  f"Apply similar logic and judgment to this new question:\n{state['question']}"),
+    ]
+    if state.get("error"):                     # retry: show the model what broke
+        messages.append(("human",
+            f"Your previous SQL:\n{state['sql']}\n\n"
+            f"It failed with:\n{state['error']}\n\n"
+            f"Write a corrected query."))
+    resp = llm.invoke(messages)
     sql = llm_text(resp).strip()
     sql = re.sub(r"^```(?:sql)?\n?", "", sql)
     sql = re.sub(r"\n?```$", "", sql)
-    return {"sql": sql.strip()}
+    sql = sql.strip()
+    # Model's honest verdict: the data genuinely doesn't exist
+    if sql.upper() == "NO_DATA":
+        return {"sql": state.get("sql"), "error": None,
+                "answer": ("No data exists for that request — the dataset may not "
+                           "cover that period or criteria.")}
+    return {"sql": sql, "error": None}
 
 def execute_sql(state: AgentState) -> dict:
-    df = runner.execute_query(state["sql"])
-    return {"result": df}
+    try:
+        df = runner.execute_query(state["sql"])
+        # Semantically empty: no rows, OR all values are NULL (aggregates over nothing)
+        if df.empty or df.isna().all().all():
+            return {"error": ("Query returned no data (zero rows or only NULL values). "
+                              "Either fix a genuine mistake in the query (wrong column, wrong join, "
+                              "wrong filter logic) while keeping the user's original intent EXACTLY — "
+                              "including any dates or filters they specified — or, if the query "
+                              "correctly reflects the question and the data simply doesn't exist, "
+                              "return exactly: NO_DATA"),
+                    "retries": state["retries"] + 1}
+        return {"result": df, "error": None}
+    except Exception as e:
+        return {"error": str(e), "retries": state["retries"] + 1}
 
+def check_execution(state: AgentState) -> str:
+    """After execution: success, retry, or give up?"""
+    if state.get("error") is None:
+        return "success"
+    if state["retries"] <= MAX_RETRIES:
+        return "retry"
+    return "give_up"
+
+def give_up(state: AgentState) -> dict:
+    return {"answer": ("I couldn't get a working query for that after a few attempts. "
+                       "Could you rephrase the question, or make it more specific?")}
+
+# ---------- Schema Q&A ----------
 def answer_schema(state: AgentState) -> dict:
     schemas = {t: runner.get_table_schema(t)
                for t in ["orders", "order_items", "products", "users"]}
@@ -100,6 +186,7 @@ builder.add_node("route_question", route_question)
 builder.add_node("generate_sql", generate_sql)
 builder.add_node("execute_sql", execute_sql)
 builder.add_node("answer_schema", answer_schema)
+builder.add_node("give_up", give_up)
 
 builder.add_edge(START, "route_question")
 builder.add_conditional_edges(
@@ -107,18 +194,28 @@ builder.add_conditional_edges(
     {"analysis": "generate_sql", "schema": "answer_schema",
      "clarify": END, "offtopic": END},
 )
-builder.add_edge("generate_sql", "execute_sql")
-builder.add_edge("execute_sql", END)
+# generate_sql either produced SQL to run, or an honest NO_DATA answer
+builder.add_conditional_edges(
+    "generate_sql",
+    lambda s: "answered" if s.get("answer") else "execute",
+    {"answered": END, "execute": "execute_sql"},
+)
+builder.add_conditional_edges(
+    "execute_sql", check_execution,
+    {"success": END, "retry": "generate_sql", "give_up": "give_up"},
+)
+builder.add_edge("answer_schema", END)
+builder.add_edge("give_up", END)
 graph = builder.compile()
 
 # ---------- CLI ----------
 if __name__ == "__main__":
-    print("Retail Data Agent (Phase 1) — type 'exit' to quit.")
+    print("Retail Data Agent (Phase 3) — type 'exit' to quit.")
     while True:
         q = input("\nAsk> ").strip()
         if q.lower() in {"exit", "quit"}:
             break
-        final = graph.invoke({"question": q})
+        final = graph.invoke({"question": q, "retries": 0})
         if final.get("answer"):
             print("\n" + final["answer"])
         else:
