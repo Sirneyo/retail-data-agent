@@ -1,4 +1,4 @@
-import os, re, json, argparse
+import os, re, json, argparse, time, uuid
 from datetime import datetime
 from typing import TypedDict, Optional
 
@@ -15,15 +15,63 @@ from bq_client import BigQueryRunner
 
 load_dotenv()
 
-# ---------- Identity: asserted via launch flag (production: SSO-verified) ----------
+# ---------- Identity + runtime flags ----------
 parser = argparse.ArgumentParser()
 parser.add_argument("--user", default="manager_a")
+parser.add_argument("--quiet", action="store_true",
+                    help="suppress the live node-by-node trace")
 args, _ = parser.parse_known_args()
 CURRENT_USER = args.user
+VERBOSE = not args.quiet
+
+# ---------- Observability: live trace + structured event log (Req 7) ----------
+LOG_FILE = "agent_log.jsonl"
+_current_qid = "----"      # correlation id of the question in flight
+_llm_calls = 0             # LLM calls used by the question in flight
+
+def new_qid() -> str:
+    return uuid.uuid4().hex[:4]
+
+def trace(msg: str):
+    """Live narration: every node announces itself, tagged with the correlation id."""
+    if VERBOSE:
+        print(f"  [{time.strftime('%H:%M:%S')}] [q-{_current_qid}] {msg}")
+
+def log_event(record: dict):
+    """Append one JSON line per completed question — machine-readable history.
+    JSONL: append-only and crash-safe; each line parses independently."""
+    with open(LOG_FILE, "a", encoding="utf-8") as f:
+        f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+def print_metrics():
+    """Agent-level metrics computed from the structured log."""
+    if not os.path.exists(LOG_FILE):
+        print("\nNo log yet — ask some questions first.")
+        return
+    rows = [json.loads(line) for line in open(LOG_FILE, encoding="utf-8") if line.strip()]
+    if not rows:
+        print("\nLog is empty.")
+        return
+    n = len(rows)
+    outcomes = {}
+    routes = {}
+    for r in rows:
+        outcomes[r.get("outcome", "?")] = outcomes.get(r.get("outcome", "?"), 0) + 1
+        routes[r.get("route", "?")] = routes.get(r.get("route", "?"), 0) + 1
+    retries = sum(r.get("retries", 0) for r in rows)
+    masked = sum(r.get("pii_masked", 0) for r in rows)
+    lat = [r["latency_s"] for r in rows if r.get("latency_s") is not None]
+    calls = sum(r.get("llm_calls", 0) for r in rows)
+    print(f"\n=== AGENT METRICS ({n} questions logged) ===")
+    print(f"Outcomes:        " + ", ".join(f"{k}: {v} ({100*v/n:.0f}%)" for k, v in sorted(outcomes.items())))
+    print(f"Routes:          " + ", ".join(f"{k}: {v}" for k, v in sorted(routes.items())))
+    print(f"Self-heal:       {retries} retries across {n} questions")
+    print(f"PII masked:      {masked} value(s) total")
+    print(f"Avg latency:     {sum(lat)/len(lat):.1f}s" if lat else "Avg latency:     n/a")
+    print(f"Total LLM calls: {calls} ({calls/n:.1f} per question)")
 
 # ---------- State: the object that flows through the graph ----------
 # NOTE: state must be serialisable (the checkpointer snapshots it after every node).
-# DataFrames live only inside nodes; state carries {"records": [...], "columns": [...]}.
 class AgentState(TypedDict):
     question: str
     route: Optional[str]
@@ -31,17 +79,24 @@ class AgentState(TypedDict):
     result: Optional[dict]          # serialised frame: records + columns
     answer: Optional[str]
     report: Optional[str]
-    error: Optional[str]            # last failure message (BigQuery's or ours)
-    retries: int                    # fix attempts so far this question
-    pii_masked: int                 # how many PII values were masked this query
-    pending_delete: Optional[list]  # reports matched for deletion, awaiting confirm
+    error: Optional[str]
+    retries: int
+    pii_masked: int
+    pending_delete: Optional[list]
 
 # ---------- Shared clients ----------
-llm = ChatGoogleGenerativeAI(
+_llm = ChatGoogleGenerativeAI(
     model="gemini-3.1-flash-lite",
     temperature=0,
     google_api_key=os.environ["GOOGLE_API_KEY"],
 )
+
+def llm_invoke(messages):
+    """Single funnel for chat calls: counts usage per question (observability)."""
+    global _llm_calls
+    _llm_calls += 1
+    return _llm.invoke(messages)
+
 runner = BigQueryRunner(project_id=os.environ.get("GCP_PROJECT_ID"))
 DATASET = "bigquery-public-data.thelook_ecommerce"
 
@@ -55,12 +110,9 @@ def load_schema_context() -> str:
     return "\n".join(lines)
 
 SCHEMA_CONTEXT = load_schema_context()
-MAX_RETRIES = 2   # total attempts = 1 original + 2 retries
+MAX_RETRIES = 2
 
-# ---------- Persona: the agent's report voice, editable WITHOUT redeployment ----------
-# Non-developers edit persona.txt; it is re-read on EVERY report, so tone changes
-# take effect on the very next question — no restart required (Requirement 8).
-# Safety rules (PII handling) deliberately stay in code: voice is editable, guardrails are not.
+# ---------- Persona: editable voice, re-read every report (Req 8) ----------
 PERSONA_FILE = "persona.txt"
 DEFAULT_PERSONA = """You are a senior retail data analyst writing for a non-technical executive.
 Given a question, the SQL used, and the result data, write a SHORT report:
@@ -70,7 +122,6 @@ Given a question, the SQL used, and the result data, write a SHORT report:
 Keep it under 120 words. No headers, no fluff, no repeating the raw table."""
 
 def load_persona() -> str:
-    """Read the persona fresh each time so edits apply immediately."""
     if os.path.exists(PERSONA_FILE):
         with open(PERSONA_FILE, "r", encoding="utf-8") as f:
             text = f.read().strip()
@@ -78,18 +129,14 @@ def load_persona() -> str:
             return text
     return DEFAULT_PERSONA
 
-# ---------- PII Masking: deterministic scrub layer (Layer 2 - the guarantee) ----------
+# ---------- PII Masking: deterministic scrub layer ----------
 PII_COLUMNS = {"email", "phone", "phone_number", "mobile", "contact"}
 MASK = "***MASKED***"
 
 EMAIL_RE = re.compile(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}")
-# Phone-shaped only; deliberately does NOT match product style codes like 404309-109.
 PHONE_RE = re.compile(r"(?<!\w)(?:\+?\d{1,3}[\s.-]?)?\(?\d{3}\)?[\s.-]?\d{3}[\s.-]?\d{4}(?!\w)")
 
 def mask_pii(df: pd.DataFrame) -> tuple[pd.DataFrame, int]:
-    """Deterministically mask PII. Two sweeps: known PII columns wholesale,
-    then regex scan of text cells (product-descriptor columns exempt).
-    Deterministic code, not an LLM: cannot be prompt-injected."""
     df = df.copy()
     hits = 0
     for col in df.columns:
@@ -107,7 +154,7 @@ def mask_pii(df: pd.DataFrame) -> tuple[pd.DataFrame, int]:
             df.loc[found, col] = MASK
     return df, hits
 
-# ---------- Saved Reports library + Golden Bucket candidate queue ----------
+# ---------- Files: reports library, candidates queue, preferences ----------
 REPORTS_FILE = "saved_reports.json"
 CANDIDATES_FILE = "bucket_candidates.json"
 PREFS_FILE = "user_preferences.json"
@@ -123,9 +170,6 @@ def save_json(path, data):
         json.dump(data, f, indent=2, ensure_ascii=False)
 
 def save_report_record(question, sql, report, owner):
-    """One save action, two destinations: user library + promotion queue.
-    Separate files because lifecycles differ: users may delete library entries;
-    bucket candidates await analyst review and have no CLI delete path."""
     now = datetime.now().isoformat(timespec="seconds")
     reports = load_json(REPORTS_FILE)
     next_id = max((r["id"] for r in reports), default=0) + 1
@@ -138,7 +182,6 @@ def save_report_record(question, sql, report, owner):
     save_json(CANDIDATES_FILE, candidates)
     return next_id
 
-# ---------- User preferences: dynamic, persistent, per-user (Req 4a) ----------
 def get_preference(user: str) -> Optional[str]:
     prefs = load_json(PREFS_FILE, default={})
     entry = prefs.get(user)
@@ -155,7 +198,6 @@ EMBED_MODEL = "gemini-embedding-001"
 genai_client = genai.Client(api_key=os.environ["GOOGLE_API_KEY"])
 
 def embed(texts: list[str]) -> np.ndarray:
-    """Convert texts to meaning-vectors via Google's embedding model."""
     result = genai_client.models.embed_content(model=EMBED_MODEL, contents=texts)
     return np.array([e.values for e in result.embeddings])
 
@@ -165,7 +207,6 @@ with open("golden_bucket.json", "r", encoding="utf-8") as f:
 BUCKET_VECTORS = embed([t["question"] for t in GOLDEN_BUCKET])
 
 def retrieve_trios(question: str, k: int = 3) -> list[dict]:
-    """Embed the new question, cosine-match against the index, return top k Trios."""
     q_vec = embed([question])[0]
     sims = BUCKET_VECTORS @ q_vec / (
         np.linalg.norm(BUCKET_VECTORS, axis=1) * np.linalg.norm(q_vec) + 1e-9)
@@ -174,7 +215,6 @@ def retrieve_trios(question: str, k: int = 3) -> list[dict]:
 
 # ---------- Helpers ----------
 def llm_text(resp) -> str:
-    """Normalise LLM reply content to a plain string across library versions."""
     c = resp.content
     if isinstance(c, str):
         return c
@@ -189,7 +229,6 @@ def llm_text(resp) -> str:
     return str(c)
 
 def state_df(state) -> pd.DataFrame:
-    """Reconstruct the result DataFrame from its serialised state form."""
     r = state["result"]
     return pd.DataFrame(r["records"], columns=r["columns"])
 
@@ -207,11 +246,12 @@ Only choose clarify when you genuinely cannot tell what data is being asked for.
 Line 1: the label. If clarify: line 2 = ONE short clarifying question."""
 
 def route_question(state: AgentState) -> dict:
-    resp = llm.invoke([("system", ROUTER_SYSTEM), ("human", state["question"])])
+    resp = llm_invoke([("system", ROUTER_SYSTEM), ("human", state["question"])])
     lines = llm_text(resp).strip().split("\n", 1)
     label = lines[0].strip().lower()
     if label not in {"analysis", "schema", "clarify", "pii_request", "delete_reports", "offtopic"}:
-        label = "analysis"          # fail open to the useful path
+        label = "analysis"
+    trace(f"route_question → {label}")
     out = {"route": label}
     if label == "clarify":
         out["answer"] = lines[1].strip() if len(lines) > 1 \
@@ -225,7 +265,7 @@ def route_question(state: AgentState) -> dict:
                          "products, customers, or revenue and I'll dig in.")
     return out
 
-# ---------- SQL generation (schema-aware, RAG-informed, self-healing, honest) ----------
+# ---------- SQL generation ----------
 SQL_SYSTEM = f"""You are a BigQuery Standard SQL expert.
 Write ONE valid query answering the user's question.
 Dataset `{DATASET}`. Schemas:
@@ -239,6 +279,8 @@ Return ONLY raw SQL — no markdown, no commentary."""
 
 def generate_sql(state: AgentState) -> dict:
     trios = retrieve_trios(state["question"], k=3)
+    trace(f"generate_sql (attempt {state['retries'] + 1}) | trios: "
+          + ", ".join(str(t["id"]) for t in trios))
     examples = "\n\n".join(
         f"Past question: {t['question']}\nAnalyst's SQL: {t['sql']}\nAnalyst's notes: {t['report']}"
         for t in trios)
@@ -247,28 +289,29 @@ def generate_sql(state: AgentState) -> dict:
         ("human", f"Here is how expert analysts answered similar past questions:\n\n{examples}\n\n"
                   f"Apply similar logic and judgment to this new question:\n{state['question']}"),
     ]
-    if state.get("error"):                     # retry: show the model what broke
+    if state.get("error"):
         messages.append(("human",
             f"Your previous SQL:\n{state['sql']}\n\n"
             f"It failed with:\n{state['error']}\n\n"
             f"Write a corrected query."))
-    resp = llm.invoke(messages)
+    resp = llm_invoke(messages)
     sql = llm_text(resp).strip()
     sql = re.sub(r"^```(?:sql)?\n?", "", sql)
     sql = re.sub(r"\n?```$", "", sql)
     sql = sql.strip()
-    # Model's honest verdict: the data genuinely doesn't exist
     if sql.upper() == "NO_DATA":
+        trace("generate_sql → NO_DATA verdict (data genuinely absent)")
         return {"sql": state.get("sql"), "error": None,
                 "answer": ("No data exists for that request — the dataset may not "
                            "cover that period or criteria.")}
     return {"sql": sql, "error": None}
 
 def execute_sql(state: AgentState) -> dict:
+    t0 = time.time()
     try:
         df = runner.execute_query(state["sql"])
-        # Semantically empty: no rows, OR all values are NULL (aggregates over nothing)
         if df.empty or df.isna().all().all():
+            trace(f"execute_sql → empty/NULL result in {time.time()-t0:.1f}s — flagging retry")
             return {"error": ("Query returned no data (zero rows or only NULL values). "
                               "Either fix a genuine mistake in the query (wrong column, wrong join, "
                               "wrong filter logic) while keeping the user's original intent EXACTLY — "
@@ -276,15 +319,15 @@ def execute_sql(state: AgentState) -> dict:
                               "correctly reflects the question and the data simply doesn't exist, "
                               "return exactly: NO_DATA"),
                     "retries": state["retries"] + 1}
-        # Serialise for state: the checkpointer snapshots state after every node
+        trace(f"execute_sql → {len(df)} rows in {time.time()-t0:.1f}s")
         return {"result": {"records": df.to_dict(orient="records"),
                            "columns": list(df.columns)},
                 "error": None}
     except Exception as e:
+        trace(f"execute_sql → FAILED: {str(e)[:100]}")
         return {"error": str(e), "retries": state["retries"] + 1}
 
 def check_execution(state: AgentState) -> str:
-    """After execution: success, retry, or give up?"""
     if state.get("error") is None:
         return "success"
     if state["retries"] <= MAX_RETRIES:
@@ -292,29 +335,27 @@ def check_execution(state: AgentState) -> str:
     return "give_up"
 
 def give_up(state: AgentState) -> dict:
+    trace("give_up → retry budget exhausted")
     return {"answer": ("I couldn't get a working query for that after a few attempts. "
                        "Could you rephrase the question, or make it more specific?")}
 
-# ---------- PII mask node: sits between execution and everything downstream ----------
+# ---------- PII mask node ----------
 def apply_pii_mask(state: AgentState) -> dict:
-    """Layer 2 enforcement point. The masked frame is the ONLY version that reaches
-    the report LLM or the screen — PII cannot leak via narrative or table."""
     masked_df, hits = mask_pii(state_df(state))
+    trace(f"apply_pii_mask → {hits} value(s) masked")
     return {"result": {"records": masked_df.to_dict(orient="records"),
                        "columns": list(masked_df.columns)},
             "pii_masked": hits}
 
-# ---------- Report generation: persona-voiced, personalised, PII-aware ----------
+# ---------- Report generation ----------
 def generate_report(state: AgentState) -> dict:
     df = state_df(state)
     sample = df.head(20).to_string(index=False)
     trios = retrieve_trios(state["question"], k=2)
     style = "\n---\n".join(t["report"] for t in trios)
 
-    # Persona re-read every call: tone edits apply to the very next report (Req 8)
     system = load_persona()
 
-    # Deterministic format precedence: inline request > stored preference > none
     pref = get_preference(CURRENT_USER)
     q_lower = state["question"].lower()
     inline = None
@@ -331,32 +372,33 @@ def generate_report(state: AgentState) -> dict:
         system += (f"\nPERSONALISATION: format the report body as {effective} "
                    f"({source}). This is a strict formatting requirement.")
 
-    # Safety stays in code, never in the persona file
     if state.get("pii_masked"):
         system += ("\nIMPORTANT: this result contains ***MASKED*** values — customer "
                    "contact details removed by data policy. You MUST state clearly that "
                    "contact details were removed for privacy compliance. If masking removed "
                    "essentially all useful content, apologise briefly and suggest a rephrased "
                    "question that works without contact details.")
-    resp = llm.invoke([
+    resp = llm_invoke([
         ("system", system),
         ("human", f"Question: {state['question']}\n\nSQL used:\n{state['sql']}\n\n"
                   f"Result ({len(df)} rows, first 20 shown):\n{sample}\n\n"
                   f"Example analyst reports for tone reference:\n{style}"),
     ])
+    trace("generate_report → done")
     return {"report": llm_text(resp)}
 
 # ---------- Schema Q&A ----------
 def answer_schema(state: AgentState) -> dict:
+    trace("answer_schema → live schema lookup")
     schemas = {t: runner.get_table_schema(t)
                for t in ["orders", "order_items", "products", "users"]}
-    resp = llm.invoke([
+    resp = llm_invoke([
         ("system", "Answer the question about this database structure, concisely."),
         ("human", f"Schemas: {schemas}\n\nQuestion: {state['question']}"),
     ])
     return {"answer": llm_text(resp)}
 
-# ---------- Delete flow: find matches (owner-scoped), then interrupt to confirm ----------
+# ---------- Delete flow ----------
 DELETE_PARSE_SYSTEM = """A user wants to delete some of their saved reports.
 Given their request and their list of saved reports (as JSON), return ONLY a JSON array
 of the report ids that match their request. Match on meaning: "mentioning X" means X
@@ -365,14 +407,14 @@ If nothing matches, return []. Return ONLY the JSON array, nothing else."""
 
 def find_reports_to_delete(state: AgentState) -> dict:
     all_reports = load_json(REPORTS_FILE)
-    # Ownership scope FIRST: users can only ever see/delete their own reports.
     mine = [r for r in all_reports if r["owner"] == CURRENT_USER]
+    trace(f"find_reports_to_delete → {len(mine)} report(s) owned by {CURRENT_USER}")
     if not mine:
         return {"answer": "You have no saved reports, so there's nothing to delete."}
     today = datetime.now().date().isoformat()
     listing = json.dumps([{k: r[k] for k in ("id", "question", "report", "saved_at")}
                           for r in mine], ensure_ascii=False)
-    resp = llm.invoke([
+    resp = llm_invoke([
         ("system", DELETE_PARSE_SYSTEM),
         ("human", f"Today's date: {today}\n\nRequest: {state['question']}\n\n"
                   f"Saved reports:\n{listing}"),
@@ -385,13 +427,12 @@ def find_reports_to_delete(state: AgentState) -> dict:
     except Exception:
         ids = set()
     matches = [r for r in mine if r["id"] in ids]
+    trace(f"find_reports_to_delete → {len(matches)} match(es)")
     if not matches:
         return {"answer": "No saved reports matched that description — nothing was deleted."}
     return {"pending_delete": matches}
 
 def confirm_delete(state: AgentState) -> dict:
-    """The human-in-the-loop gate: the graph PAUSES here until the user decides.
-    Informed consent: show exactly what will be deleted, require exact CONFIRM."""
     matches = state["pending_delete"]
     summary = "\n".join(f"  - [{m['saved_at']}] {m['question']}" for m in matches)
     decision = interrupt(
@@ -401,7 +442,9 @@ def confirm_delete(state: AgentState) -> dict:
         reports = load_json(REPORTS_FILE)
         ids = {m["id"] for m in matches}
         save_json(REPORTS_FILE, [r for r in reports if r["id"] not in ids])
+        trace(f"confirm_delete → CONFIRMED, {len(matches)} deleted")
         return {"answer": f"Deleted {len(matches)} report(s).", "pending_delete": None}
+    trace("confirm_delete → cancelled by user")
     return {"answer": "Deletion cancelled — nothing was removed.", "pending_delete": None}
 
 def check_delete_matches(state: AgentState) -> str:
@@ -426,7 +469,6 @@ builder.add_conditional_edges(
      "clarify": END, "pii_request": END, "offtopic": END,
      "delete_reports": "find_reports_to_delete"},
 )
-# generate_sql either produced SQL to run, or an honest NO_DATA answer
 builder.add_conditional_edges(
     "generate_sql",
     lambda s: "answered" if s.get("answer") else "execute",
@@ -446,17 +488,17 @@ builder.add_edge("answer_schema", END)
 builder.add_edge("give_up", END)
 builder.add_edge("confirm_delete", END)
 
-# Checkpointer: required so the graph can PAUSE at interrupt() and resume.
 graph = builder.compile(checkpointer=MemorySaver())
 
 # ---------- CLI ----------
 if __name__ == "__main__":
-    print(f"Retail Data Agent (Phase 8) — user: {CURRENT_USER}")
+    print(f"Retail Data Agent (Phase 9) — user: {CURRENT_USER}")
     pref = get_preference(CURRENT_USER)
-    print(f"Report format preference: {pref or 'none set'} | Persona: "
-          f"{'persona.txt' if os.path.exists(PERSONA_FILE) else 'built-in default'}")
-    print("Ask about sales, products, customers. Commands: 'save that', "
-          "'prefer <format>', 'my preferences', 'delete reports ...', 'exit'.")
+    print(f"Format preference: {pref or 'none set'} | Persona: "
+          f"{'persona.txt' if os.path.exists(PERSONA_FILE) else 'built-in default'} | "
+          f"Trace: {'on' if VERBOSE else 'off (--quiet)'}")
+    print("Commands: 'save that', 'prefer <format>', 'my preferences', "
+          "'delete reports ...', 'metrics', 'exit'.")
     last = {"question": None, "sql": None, "report": None}
     turn = 0
     while True:
@@ -464,7 +506,10 @@ if __name__ == "__main__":
         if q.lower() in {"exit", "quit"}:
             break
 
-        # Command traffic bypasses the LLM router: deterministic dispatch
+        if q.lower() == "metrics":
+            print_metrics()
+            continue
+
         if q.lower() in {"save that", "save this", "save report", "save"}:
             if last["report"]:
                 rid = save_report_record(last["question"], last["sql"],
@@ -490,17 +535,54 @@ if __name__ == "__main__":
                   f"(set one with: prefer <format>)")
             continue
 
+        # ----- observed question lifecycle -----
         turn += 1
+        _current_qid = new_qid()
+        _llm_calls = 0
+        t_start = time.time()
         config = {"configurable": {"thread_id": f"{CURRENT_USER}-{turn}"}}
-        final = graph.invoke({"question": q, "retries": 0, "pii_masked": 0,
-                              "pending_delete": None}, config)
+        outcome = "success"
+        try:
+            final = graph.invoke({"question": q, "retries": 0, "pii_masked": 0,
+                                  "pending_delete": None}, config)
+            while "__interrupt__" in final:
+                prompt_text = final["__interrupt__"][0].value
+                print("\n" + prompt_text)
+                reply = input("Your decision> ").strip()
+                final = graph.invoke(Command(resume=reply), config)
+        except Exception as e:
+            outcome = "crash"
+            print(f"\nSomething went wrong on our side — please try again. ({str(e)[:80]})")
+            log_event({"qid": _current_qid, "ts": datetime.now().isoformat(timespec="seconds"),
+                       "user": CURRENT_USER, "question": q, "route": None,
+                       "outcome": outcome, "retries": None, "pii_masked": None,
+                       "latency_s": round(time.time() - t_start, 1), "llm_calls": _llm_calls,
+                       "error": str(e)[:200]})
+            continue
 
-        # Interrupt dance: graph paused at the confirmation gate
-        while "__interrupt__" in final:
-            prompt_text = final["__interrupt__"][0].value
-            print("\n" + prompt_text)
-            reply = input("Your decision> ").strip()
-            final = graph.invoke(Command(resume=reply), config)
+        # classify outcome for the log
+        route = final.get("route")
+        if final.get("answer"):
+            a = final["answer"]
+            if a.startswith("I couldn't get a working query"):
+                outcome = "give_up"
+            elif a.startswith("Deleted"):
+                outcome = "delete_confirmed"
+            elif a.startswith("Deletion cancelled"):
+                outcome = "delete_cancelled"
+            elif a.startswith("No data exists"):
+                outcome = "no_data"
+            elif route in {"pii_request", "offtopic"}:
+                outcome = "refused"
+            elif route == "clarify":
+                outcome = "clarify"
+            else:
+                outcome = "answered"
+        log_event({"qid": _current_qid, "ts": datetime.now().isoformat(timespec="seconds"),
+                   "user": CURRENT_USER, "question": q, "route": route,
+                   "outcome": outcome, "retries": final.get("retries", 0),
+                   "pii_masked": final.get("pii_masked", 0),
+                   "latency_s": round(time.time() - t_start, 1), "llm_calls": _llm_calls})
 
         if final.get("answer"):
             print("\n" + final["answer"])

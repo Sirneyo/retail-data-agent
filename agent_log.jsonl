@@ -1,0 +1,1 @@
+{"qid": "200f", "ts": "2026-07-08T21:36:01", "user": "manager_a", "question": "top 5 products by revenue", "route": "analysis", "outcome": "success", "retries": 0, "pii_masked": 0, "latency_s": 7.1, "llm_calls": 3}
