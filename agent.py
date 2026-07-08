@@ -57,6 +57,27 @@ def load_schema_context() -> str:
 SCHEMA_CONTEXT = load_schema_context()
 MAX_RETRIES = 2   # total attempts = 1 original + 2 retries
 
+# ---------- Persona: the agent's report voice, editable WITHOUT redeployment ----------
+# Non-developers edit persona.txt; it is re-read on EVERY report, so tone changes
+# take effect on the very next question — no restart required (Requirement 8).
+# Safety rules (PII handling) deliberately stay in code: voice is editable, guardrails are not.
+PERSONA_FILE = "persona.txt"
+DEFAULT_PERSONA = """You are a senior retail data analyst writing for a non-technical executive.
+Given a question, the SQL used, and the result data, write a SHORT report:
+- Lead with the direct answer in one sentence
+- 2-3 bullet points of notable insights from the data
+- One caveat or recommendation if genuinely relevant
+Keep it under 120 words. No headers, no fluff, no repeating the raw table."""
+
+def load_persona() -> str:
+    """Read the persona fresh each time so edits apply immediately."""
+    if os.path.exists(PERSONA_FILE):
+        with open(PERSONA_FILE, "r", encoding="utf-8") as f:
+            text = f.read().strip()
+        if text:
+            return text
+    return DEFAULT_PERSONA
+
 # ---------- PII Masking: deterministic scrub layer (Layer 2 - the guarantee) ----------
 PII_COLUMNS = {"email", "phone", "phone_number", "mobile", "contact"}
 MASK = "***MASKED***"
@@ -89,12 +110,13 @@ def mask_pii(df: pd.DataFrame) -> tuple[pd.DataFrame, int]:
 # ---------- Saved Reports library + Golden Bucket candidate queue ----------
 REPORTS_FILE = "saved_reports.json"
 CANDIDATES_FILE = "bucket_candidates.json"
+PREFS_FILE = "user_preferences.json"
 
-def load_json(path):
+def load_json(path, default=None):
     if os.path.exists(path):
         with open(path, "r", encoding="utf-8") as f:
             return json.load(f)
-    return []
+    return [] if default is None else default
 
 def save_json(path, data):
     with open(path, "w", encoding="utf-8") as f:
@@ -115,6 +137,18 @@ def save_report_record(question, sql, report, owner):
                        "saved_by": owner, "saved_at": now, "status": "pending"})
     save_json(CANDIDATES_FILE, candidates)
     return next_id
+
+# ---------- User preferences: dynamic, persistent, per-user (Req 4a) ----------
+def get_preference(user: str) -> Optional[str]:
+    prefs = load_json(PREFS_FILE, default={})
+    entry = prefs.get(user)
+    return entry.get("format") if entry else None
+
+def set_preference(user: str, value: str):
+    prefs = load_json(PREFS_FILE, default={})
+    prefs[user] = {"format": value,
+                   "updated_at": datetime.now().isoformat(timespec="seconds")}
+    save_json(PREFS_FILE, prefs)
 
 # ---------- Golden Bucket: RAG retrieval layer ----------
 EMBED_MODEL = "gemini-embedding-001"
@@ -270,20 +304,34 @@ def apply_pii_mask(state: AgentState) -> dict:
                        "columns": list(masked_df.columns)},
             "pii_masked": hits}
 
-# ---------- Report generation: the analyst write-up ----------
-REPORT_SYSTEM = """You are a senior retail data analyst writing for a non-technical executive.
-Given a question, the SQL used, and the result data, write a SHORT report:
-- Lead with the direct answer in one sentence
-- 2-3 bullet points of notable insights from the data
-- One caveat or recommendation if genuinely relevant
-Keep it under 120 words. No headers, no fluff, no repeating the raw table."""
-
+# ---------- Report generation: persona-voiced, personalised, PII-aware ----------
 def generate_report(state: AgentState) -> dict:
     df = state_df(state)
     sample = df.head(20).to_string(index=False)
     trios = retrieve_trios(state["question"], k=2)
     style = "\n---\n".join(t["report"] for t in trios)
-    system = REPORT_SYSTEM
+
+    # Persona re-read every call: tone edits apply to the very next report (Req 8)
+    system = load_persona()
+
+    # Deterministic format precedence: inline request > stored preference > none
+    pref = get_preference(CURRENT_USER)
+    q_lower = state["question"].lower()
+    inline = None
+    if "bullet" in q_lower:
+        inline = "bullet points"
+    elif "table" in q_lower:
+        inline = "a compact markdown table"
+    elif "narrative" in q_lower or "prose" in q_lower:
+        inline = "narrative prose"
+    effective = inline or pref
+    if effective:
+        source = ("explicitly requested in this question" if inline
+                  else "this executive's stored preference")
+        system += (f"\nPERSONALISATION: format the report body as {effective} "
+                   f"({source}). This is a strict formatting requirement.")
+
+    # Safety stays in code, never in the persona file
     if state.get("pii_masked"):
         system += ("\nIMPORTANT: this result contains ***MASKED*** values — customer "
                    "contact details removed by data policy. You MUST state clearly that "
@@ -403,9 +451,12 @@ graph = builder.compile(checkpointer=MemorySaver())
 
 # ---------- CLI ----------
 if __name__ == "__main__":
-    print(f"Retail Data Agent (Phase 6) — user: {CURRENT_USER}")
-    print("Ask about sales, products, customers. Commands: 'save that' (save last report), "
-          "'delete reports ...' (with confirmation), 'exit'.")
+    print(f"Retail Data Agent (Phase 8) — user: {CURRENT_USER}")
+    pref = get_preference(CURRENT_USER)
+    print(f"Report format preference: {pref or 'none set'} | Persona: "
+          f"{'persona.txt' if os.path.exists(PERSONA_FILE) else 'built-in default'}")
+    print("Ask about sales, products, customers. Commands: 'save that', "
+          "'prefer <format>', 'my preferences', 'delete reports ...', 'exit'.")
     last = {"question": None, "sql": None, "report": None}
     turn = 0
     while True:
@@ -422,6 +473,21 @@ if __name__ == "__main__":
                       f"Also queued as a Golden Bucket candidate for analyst review.")
             else:
                 print("\nNo report to save yet — run an analysis first.")
+            continue
+
+        if q.lower().startswith("prefer "):
+            value = q[7:].strip()
+            if value:
+                set_preference(CURRENT_USER, value)
+                print(f"\nPreference saved: format = {value} (user: {CURRENT_USER})")
+            else:
+                print("\nUsage: prefer <format>  — e.g. 'prefer tables', 'prefer bullets'")
+            continue
+
+        if q.lower() in {"my preferences", "preferences", "prefer"}:
+            pref = get_preference(CURRENT_USER)
+            print(f"\nYour report format preference: {pref or 'none set'} "
+                  f"(set one with: prefer <format>)")
             continue
 
         turn += 1
