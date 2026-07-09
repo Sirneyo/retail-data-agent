@@ -1,1 +1,4 @@
 {"qid": "200f", "ts": "2026-07-08T21:36:01", "user": "manager_a", "question": "top 5 products by revenue", "route": "analysis", "outcome": "success", "retries": 0, "pii_masked": 0, "latency_s": 7.1, "llm_calls": 3}
+{"qid": "3ee8", "ts": "2026-07-09T08:56:20", "user": "manager_a", "question": "top 5 products by revenue", "route": "analysis", "outcome": "answered", "retries": 0, "pii_masked": 0, "latency_s": 7.4, "llm_calls": 3}
+{"qid": "ebf9", "ts": "2026-07-09T08:56:36", "user": "manager_a", "question": "what about by units sold?", "route": "analysis", "outcome": "answered", "retries": 0, "pii_masked": 0, "latency_s": 6.0, "llm_calls": 3}
+{"qid": "aa95", "ts": "2026-07-09T08:56:59", "user": "manager_a", "question": "and which of those is most profitable?", "route": "analysis", "outcome": "answered", "retries": 0, "pii_masked": 0, "latency_s": 6.4, "llm_calls": 3}

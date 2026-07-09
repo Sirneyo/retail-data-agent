@@ -1,8 +1,9 @@
 ```mermaid
 flowchart TB
-    subgraph CLIENT["Client Layer - CLI"]
+    subgraph CLIENT["Client Layer - CLI + session memory"]
         CLI["CLI Loop<br/>--user identity flag"]
         CMD{"Deterministic<br/>command dispatch"}
+        MEM["conversation_memory<br/>rolling 3-turn window (RAM)"]
         CLI --> CMD
         CMD -->|"save that"| SAVE["save_report_record"]
         CMD -->|"prefer X / metrics"| LOCAL["prefs / metrics<br/>(no LLM)"]
@@ -11,11 +12,11 @@ flowchart TB
 
     subgraph AGENT["LangGraph Agent Core (checkpointed)"]
         GRAPH_IN(("START"))
-        ROUTER["route_question<br/>6-way LLM router"]
-        GENSQL["generate_sql<br/>schema + RAG-informed"]
+        ROUTER["route_question<br/>6-way LLM router<br/>context-aware"]
+        GENSQL["generate_sql<br/>schema + RAG + context"]
         EXEC["execute_sql<br/>error and empty detection"]
         MASK["apply_pii_mask<br/>deterministic scrub"]
-        REPORT["generate_report<br/>persona + preferences"]
+        REPORT["generate_report<br/>persona + preferences + context"]
         SCHEMA_N["answer_schema"]
         GIVEUP["give_up"]
         FINDDEL["find_reports_to_delete<br/>owner-scoped"]
@@ -61,6 +62,8 @@ flowchart TB
         EVAL["eval_agent.py<br/>10-case harness"]
     end
 
+    CLI -.updates after each turn.-> MEM
+    MEM -.context injected.-> ROUTER
     GENSQL -.retrieve top-3 Trios.-> BUCKET
     GENSQL -.-> LLM
     ROUTER -.-> LLM
