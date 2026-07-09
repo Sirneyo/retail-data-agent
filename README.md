@@ -8,7 +8,6 @@ with human confirmation gating any destructive action.
 Built with **LangGraph + Gemini + BigQuery** against the public
 `thelook_ecommerce` dataset.
 
-![Architecture](#architecture-diagram) *(diagram below)*
 
 ## Quick start
 
