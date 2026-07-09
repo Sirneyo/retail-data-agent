@@ -2,3 +2,8 @@
 .env
 __pycache__/
 *.pyc
+agent_log.jsonl
+eval_results.json
+saved_reports.json
+bucket_candidates.json
+user_preferences.json
