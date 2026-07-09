@@ -14,5 +14,21 @@
     "saved_by": "manager_a",
     "saved_at": "2026-07-08T21:33:05",
     "status": "pending"
+  },
+  {
+    "question": "what about by units sold?",
+    "sql": "SELECT p.id AS product_id, p.name AS product_name, p.brand, COUNT(*) AS units_sold, ROUND(SUM(oi.sale_price), 2) AS total_revenue FROM `bigquery-public-data.thelook_ecommerce.order_items` oi JOIN `bigquery-public-data.thelook_ecommerce.products` p ON oi.product_id = p.id WHERE oi.status NOT IN ('Cancelled', 'Returned') GROUP BY p.id, p.name, p.brand ORDER BY units_sold DESC LIMIT 5",
+    "report": "| Metric | Insight |\n| :--- | :--- |\n| **Direct Answer** | Our highest-volume products are led by Fred Perry sweaters and Affliction jeans, both moving 16 units each. |\n| **Key Trends** | High-volume items are primarily lower-priced accessories and basics, contrasting sharply with the premium outerwear that drives our top revenue. |\n| **Key Trends** | There is a significant price disparity; for example, the Sock It To Me knee-highs move as many units as the Ray-Ban sunglasses but generate 90% less revenue. |\n| **Recommendation** | Use these volume leaders for inventory turnover and customer acquisition, but prioritize the previous revenue-leading list for margin-focused marketing campaigns. |",
+    "saved_by": "manager_a",
+    "saved_at": "2026-07-09T09:52:21",
+    "status": "pending"
+  },
+  {
+    "question": "what about by units sold?",
+    "sql": "SELECT p.id AS product_id, p.name AS product_name, p.brand, COUNT(*) AS units_sold, ROUND(SUM(oi.sale_price), 2) AS total_revenue FROM `bigquery-public-data.thelook_ecommerce.order_items` oi JOIN `bigquery-public-data.thelook_ecommerce.products` p ON oi.product_id = p.id WHERE oi.status NOT IN ('Cancelled', 'Returned') GROUP BY p.id, p.name, p.brand ORDER BY units_sold DESC LIMIT 5",
+    "report": "| Metric | Insight |\n| :--- | :--- |\n| **Direct Answer** | Our highest-volume products are led by Fred Perry sweaters and Affliction jeans, both moving 16 units each. |\n| **Key Trends** | High-volume items are primarily lower-priced accessories and basics, contrasting sharply with the premium outerwear that drives our top revenue. |\n| **Key Trends** | There is a significant price disparity; for example, the Sock It To Me knee-highs move as many units as the Ray-Ban sunglasses but generate 90% less revenue. |\n| **Recommendation** | Use these volume leaders for inventory turnover and customer acquisition, but prioritize the previous revenue-leading list for margin-focused marketing campaigns. |",
+    "saved_by": "manager_a",
+    "saved_at": "2026-07-09T09:53:47",
+    "status": "pending"
   }
 ]

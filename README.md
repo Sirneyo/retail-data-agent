@@ -72,8 +72,88 @@ no restart needed.
 
 ## Example session
 ```
-(paste a fresh terminal capture here: one analysis question with trace,
-one follow-up, one save, one delete-with-confirmation)
+(.venv) PS C:\Users\HP\Documents\Projects\Retail Agent> python agent.py
+Retail Data Agent — user: manager_a
+Format preference: tables | Persona: persona.txt | Trace: on
+Commands: 'save that', 'prefer <format>', 'my preferences', 'delete reports ...', 'metrics', 'exit'.
+
+Ask> top 5 products by revenue
+  [09:53:23] [q-8725] route_question → analysis
+  [09:53:24] [q-8725] generate_sql (attempt 1) | trios: 3, 4, 1
+  [09:53:28] [q-8725] execute_sql → 5 rows in 3.0s
+  [09:53:28] [q-8725] apply_pii_mask → 0 value(s) masked
+  [09:53:29] [q-8725] generate_report → done
+
+=== REPORT ===
+| Metric | Insight |
+| :--- | :--- |
+| **Direct Answer** | Our top five revenue-generating products are dominated by premium men’s outerwear and athletic apparel, each contributing between $7,300 and $8,100. |
+| **Key Trends** | Three distinct products are currently tied for the top revenue spot, suggesting high demand consistency across these specific premium SKUs. |
+| **Key Trends** | The list is heavily skewed toward high-ticket items, indicating that our revenue leaders are driven by price point rather than sheer volume. |
+| **Recommendation** | Since these items are high-value, ensure inventory levels are strictly monitored to avoid stockouts on these primary revenue drivers. |
+
+--- SQL ---
+SELECT p.id AS product_id, p.name AS product_name, ROUND(SUM(oi.sale_price), 2) AS total_revenue FROM `bigquery-public-data.thelook_ecommerce.order_items` AS oi JOIN `bigquery-public-data.thelook_ecommerce.products` AS p ON oi.product_id = p.id WHERE oi.status NOT IN ('Cancelled', 'Returned') GROUP BY p.id, p.name ORDER BY total_revenue DESC LIMIT 5
+
+--- DATA (first 20 rows) ---
+ product_id                                                      product_name  total_revenue
+      18656                            JORDAN DURASHEEN SHORT MENS 404309-109         8127.0
+      24201 Mens Nike AirJordan Varsity Hoodie Jacket Grey / Black 451582-066         8127.0
+      17094              The North Face Apex Bionic Soft Shell Jacket - Men's         8127.0
+       7649                                 Magaschoni Women's Shimmer Jacket         7678.0
+      23803                             Canada Goose Men's The Chateau Jacket         7335.0
+
+(say 'save that' to keep this report)
+
+Ask> what about by units sold?
+  [09:53:37] [q-5bec] route_question → analysis
+  [09:53:37] [q-5bec] generate_sql (attempt 1) | trios: 3, 4, 5
+  [09:53:41] [q-5bec] execute_sql → 5 rows in 3.2s
+  [09:53:41] [q-5bec] apply_pii_mask → 0 value(s) masked
+  [09:53:43] [q-5bec] generate_report → done
+
+=== REPORT ===
+| Metric | Insight |
+| :--- | :--- |
+| **Direct Answer** | Our highest-volume products are led by Fred Perry sweaters and Affliction jeans, both moving 16 units each. |
+| **Key Trends** | High-volume items are primarily lower-priced accessories and basics, contrasting sharply with the premium outerwear that drives our top revenue. |
+| **Key Trends** | There is a significant price disparity; for example, the Sock It To Me knee-highs move as many units as the Ray-Ban sunglasses but generate 90% less revenue. |
+| **Recommendation** | Use these volume leaders for inventory turnover and customer acquisition, but prioritize the previous revenue-leading list for margin-focused marketing campaigns. |
+
+--- SQL ---
+SELECT p.id AS product_id, p.name AS product_name, p.brand, COUNT(*) AS units_sold, ROUND(SUM(oi.sale_price), 2) AS total_revenue FROM `bigquery-public-data.thelook_ecommerce.order_items` oi JOIN `bigquery-public-data.thelook_ecommerce.products` p ON oi.product_id = p.id WHERE oi.status NOT IN ('Cancelled', 'Returned') GROUP BY p.id, p.name, p.brand ORDER BY units_sold DESC LIMIT 5
+
+--- DATA (first 20 rows) ---
+ product_id                                                                    product_name         brand  units_sold  total_revenue
+      19521                                        Fred Perry Men's Tweed Wrap Neck Sweater    Fred Perry          16        2240.00
+      21350 Affliction-Men Jeans Blake Paneled Rough Fleur Tarmac Flap Relaxed Straight leg    Affliction          16        2160.00
+      14148                                Ray-Ban RB 3217 Sunglasses- All Colors And SIZES       Ray-Ban          15        1527.60
+      25159                                            Sock It To Me Anchors Knee High Sock Sock It To Me          15         139.05
+      26437                                 Coldmaster Big & Tall Superweight Thermal Shirt    COLDMASTER          15         179.40
+
+(say 'save that' to keep this report)
+
+Ask> save that
+
+Saved as report #3 (owner: manager_a). Also queued as a Golden Bucket candidate for analyst review.
+
+Ask> delete the reports about products
+  [09:53:57] [q-d6d8] route_question → delete_reports
+  [09:53:57] [q-d6d8] find_reports_to_delete → 3 report(s) owned by manager_a
+  [09:53:58] [q-d6d8] find_reports_to_delete → 3 match(es)
+
+You are about to permanently delete 3 report(s):
+  - [2026-07-08T21:33:05] top 5 products by revenue
+  - [2026-07-09T09:52:21] what about by units sold?
+  - [2026-07-09T09:53:47] what about by units sold?
+Type CONFIRM to proceed, or anything else to cancel.
+Your decision> CONFIRM
+  [09:54:23] [q-d6d8] confirm_delete → CONFIRMED, 3 deleted
+
+Deleted 3 report(s).
+
+Ask> exit
+(.venv) PS C:\Users\HP\Documents\Projects\Retail Agent> 
 ```
 
 ## Evaluation
